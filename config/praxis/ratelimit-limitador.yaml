@@ -1,0 +1,76 @@
+# Ratelimit/Limitador - Praxis PPE `ratelimit/limitador` plugin (request-count,
+# EMBEDDED in-memory Limitador). Plugin from praxis-proxy/policy (merged PR #178).
+#
+# Chain: policy -> router -> load_balancer. The `policy` filter embeds the Praxis
+# Policy Engine; the policy document (ratelimit-policy.yaml) declares:
+#   - identity/jwt   : verifies RS256 JWT (JWKS over http), exposes `tier` claim
+#   - ratelimit      : per-request-count budget keyed on the `tier` claim,
+#                      evaluated in-process, at the ratelimit.post_identity hook
+#
+# DESIGN NOTE: The ratelimit plugin runs at the engine hook `ratelimit.post_identity`
+# (NOT `http.request`, and it "cannot run from an APL run(name) step"). The host
+# (core's policy filter) must invoke this hook after identity resolution -- that
+# wiring is tracked upstream by praxis-proxy/praxis#1478 and is NOT in any released
+# core, so this config requires building with APPLY_RATELIMIT_PATCHES=true.
+#
+# Config shape:
+#   * Plugin declares `hooks: [ratelimit.post_identity]`
+#   * `global.rate_limits:` list SELECTS the limiter (like `authentication:` selects
+#     identity resolvers) -- NOT authorization/run()
+#   * Enterprise exemption: no limit matches tier == enterprise -> unmetered
+#   * Over-budget denial: HTTP 429
+#   * Missing/non-string bound attribute: denied (so no `tier` claim = denied)
+#
+# Requires:
+#   - Build: PRAXIS_FEATURES=full,experimental-ratelimit APPLY_RATELIMIT_PATCHES=true
+#   - Runtime: PRAXIS_POLICY_CONFIG=ratelimit-policy.yaml
+
+admin:
+  metrics_address: "0.0.0.0:9901"
+
+listeners:
+  - name: ai
+    address: "0.0.0.0:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: policy
+        config_path: /etc/praxis/policy.yaml
+        # Permit policy-engine JWKS fetch to reach Docker service IP.
+        # No body_access: the plugin acts around identity.resolve (pre-body).
+        allow_private_idp: true
+
+      - filter: router
+        routes:
+          - path: "/v1/chat/completions"
+            cluster: openai_backend
+          - path: "/v1/embeddings"
+            cluster: openai_backend
+          - path_prefix: "/v1/models"
+            cluster: openai_backend
+          - path: "/v1/messages"
+            cluster: anthropic_backend
+          - path_prefix: "/v1beta/models/"
+            cluster: gemini_backend
+
+      - filter: access_log
+
+      - filter: load_balancer
+        clusters:
+          - name: openai_backend
+            endpoints:
+              - "mock-llm:1080"
+          - name: anthropic_backend
+            endpoints:
+              - "mock-llm:1080"
+          - name: gemini_backend
+            endpoints:
+              - "mock-llm:1080"
+
+insecure_options:
+  allow_private_upstreams: true
+  allow_private_endpoints: true
+  allow_root: true  # Docker runs as root by default

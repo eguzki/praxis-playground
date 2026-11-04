@@ -1,0 +1,5 @@
+# Ignore generated JWT keys and tokens
+private.pem
+public.pem
+jwks.json
+tokens/

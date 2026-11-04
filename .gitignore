@@ -1,0 +1,27 @@
+# Environment
+.env
+
+# JWT keys and tokens (generated)
+jwt/private.pem
+jwt/public.pem
+jwt/jwks.json
+jwt/tokens/
+
+# Docker volumes
+.docker/
+
+# Build artifacts
+build/praxis/.cache/
+
+# Logs
+*.log
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

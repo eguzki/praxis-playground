@@ -1,0 +1,90 @@
+# Policy Engine configuration for ratelimit/limitador plugin
+#
+# This policy document defines:
+#   - identity/jwt: RS256 JWT verification via JWKS, exposes `tier` claim
+#   - ratelimit/limitador: Request-count budgets keyed on tier claim, embedded Limitador
+#
+# The ratelimit plugin runs at ratelimit.post_identity hook (after identity.resolve),
+# so limits can key on the resolved subject and claims.
+
+plugins:
+  - name: jwt-user
+    kind: identity/jwt
+    hooks: [identity.resolve]
+    on_error: fail
+    # Needs perform_http to fetch the JWKS from the issuer.
+    capabilities: [perform_http]
+    config:
+      # Merged engine prefers `credential:` over the deprecated `header:`.
+      credential:
+        kind: header
+        name: Authorization
+      trusted_issuers:
+        - issuer: "https://jwt-issuer.praxis.local"
+          audiences: ["praxis-playground"]
+          algorithms: ["RS256"]
+          decoding_key:
+            kind: jwks_url
+            url: "http://jwt-issuer/jwks.json"
+            insecure_http: true
+      claim_mapper: standard
+      # Expose the custom `tier` claim so the ratelimit bindings can read it.
+      claims:
+        include: [tier]
+
+  - name: ratelimit
+    kind: ratelimit/limitador
+    # The stage is selected by the hook the plugin declares. post_identity
+    # lets limits key on the resolved subject/claims (vs pre_identity, which
+    # runs before token verification and keys on client address).
+    hooks: [ratelimit.post_identity]
+    mode: sequential
+    # read_subject -> subject.id; read_headers -> http.method; read_claims ->
+    # claim.tier. A missing/non-string bound attribute DENIES the request.
+    capabilities: [read_subject, read_headers, read_claims]
+    config:
+      namespace: praxis-ratelimit-requests
+      counter_capacity: 1000
+      # Bind PPE attributes to flat CEL variable names used by the limits.
+      bindings:
+        subject_id: subject.id
+        http_method: http.method
+        tier: claim.tier
+      # M5: multiple budgets, each keyed (`variables`) on the tier claim so
+      # the per-tier counters are independent. Small on purpose (easy 429).
+      # enterprise matches NO limit here -> unmetered (M1 exemption via
+      # conditions, no APL when-gate needed).
+      limits:
+        - max: 5
+          seconds: 60
+          conditions: ["tier == 'gold'"]
+          variables: ["tier"]
+        - max: 2
+          seconds: 60
+          conditions: ["tier == 'silver'"]
+          variables: ["tier"]
+        # Default/catch-all for any other authenticated tier (e.g. `basic`);
+        # excludes enterprise so enterprise stays unmetered.
+        - max: 3
+          seconds: 60
+          conditions:
+            - "tier != 'gold'"
+            - "tier != 'silver'"
+            - "tier != 'enterprise'"
+          variables: ["tier"]
+
+global:
+  authentication:
+    - jwt-user
+  # SELECT the rate limiter (merged design: like `authentication:` selects
+  # identity resolvers). The plugin's `hooks:` picks the stage; this list
+  # wires it in. NOT an APL authorization/run() step (which the merged engine
+  # rejects for a rate-limit-only plugin).
+  rate_limits:
+    - ratelimit
+  # require(authenticated) keeps the http.request authorization path active,
+  # which is where the host forward-port invokes ratelimit.post_identity
+  # (after identity.resolve); it also rejects unauthenticated calls (401).
+  authorization:
+    pre_invocation:
+      - "require(authenticated)"
