@@ -1,0 +1,56 @@
+# Basic gateway config for the RELEASED prebuilt image (./build/build-basic.sh).
+#
+# This uses ONLY filters compiled into the released image:
+#   router, access_log, load_balancer
+# (Token rate limiting is NOT here: `token_rate_limit` is gated behind the
+#  `token-rate-limit-filter` cargo feature, which the published release does not
+#  enable; `model_to_header` is likewise absent.)
+#
+# This is a minimal, working proxy baseline. Tune it to exercise whatever
+# capabilities the released image actually ships (e.g. the request-count
+# `rate_limit` filter) as needed.
+
+# Health + Prometheus metrics (/healthy, /ready, /metrics) on :9901.
+admin:
+  metrics_address: "0.0.0.0:9901"
+
+listeners:
+  - name: ai
+    address: "0.0.0.0:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: router
+        routes:
+          - path: "/v1/chat/completions"
+            cluster: openai_backend
+          - path: "/v1/embeddings"
+            cluster: openai_backend
+          - path_prefix: "/v1/models"
+            cluster: openai_backend
+          - path: "/v1/messages"
+            cluster: anthropic_backend
+          - path_prefix: "/v1beta/models/"
+            cluster: gemini_backend
+
+      - filter: access_log
+
+      - filter: load_balancer
+        clusters:
+          - name: openai_backend
+            endpoints:
+              - "mock-llm:1080"
+          - name: anthropic_backend
+            endpoints:
+              - "mock-llm:1080"
+          - name: gemini_backend
+            endpoints:
+              - "mock-llm:1080"
+
+insecure_options:
+  allow_private_upstreams: true
+  allow_private_endpoints: true
+  allow_root: true  # harmless; the released image runs as non-root `praxis`

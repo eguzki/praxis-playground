@@ -1,59 +1,77 @@
 # Praxis Playground - Developer Guide
 
-This is a **Docker Compose-based playground** for testing Praxis AI gateway rate-limiting features. It replaces a heavier Kubernetes setup with a simpler, faster development environment.
+A **Docker Compose-based playground** for building and testing the Praxis AI gateway's rate-limiting features.
 
 ## Project Purpose
 
-Validates Praxis token rate-limiting features against **M1-M7 acceptance criteria**:
-- **M1**: Applicability (tiered budgets, exemptions, defaults)
-- **M2**: Reserve→reconcile (reserve at admission, reconcile against actual usage)
-- **M3**: Estimation (derive reserved amount from request body `max_tokens`)
-- **M4**: Token-type weighting (cached_input discounted)
-- **M5**: Multiple budgets (per-tier, per-model independence)
-- **M6**: Denial semantics (HTTP 429 with `X-RateLimit-*` headers)
-- **M7**: Observability (metrics, accounting logs)
+Playground for building and running the Praxis AI gateway in two forms (released
+image vs. source-compiled `experimental-ratelimit`) and exercising the experimental
+request-count rate limiting plugin.
+
+> **Note**: token-based rate limiting (`token_rate_limit`, the M1-M7 criteria) is
+> **not available in any build here** — the filter is gated behind the
+> `token-rate-limit-filter` cargo feature, which neither the released image nor the
+> experimental build enables. The remaining acceptance coverage is M1 (exemption)
+> + M5 (independent per-tier counters) via the ratelimit plugin.
 
 ## Architecture
 
-**Single configurable gateway** with swappable runtime configs:
-- **token-rate-limit.yaml** ✅ (default, M1-M7 verified, native filter)
-- **ratelimit-limitador.yaml** ✅ (PPE plugin, embedded Limitador, M1+M5 verified, requires patches)
+**Two builds**, each with its own standalone build script (the single source of
+truth for versions/features — there are no generic feature/source knobs):
+- **Basic** — `./build/build-basic.sh` pulls the released prebuilt image
+  (`ghcr.io/praxis-proxy/ai:0.9`, pinned in the script), runs `basic.yaml` (a
+  minimal `router → access_log → load_balancer` proxy). No local compile.
+  **The released image does NOT include `token_rate_limit` or `model_to_header`**
+  (both gated behind the `token-rate-limit-filter` feature).
+- **Experimental** — `./build/build-experimental.sh` compiles from source with
+  only `experimental-ratelimit` (PPE plugin, embedded Limitador, M1+M5), runs
+  `ratelimit-limitador.yaml` + `ratelimit-policy.yaml`. Vendors policy + core and
+  applies patches (~5-10 min).
+
+Each script produces a tagged image (`praxis-gateway:basic` /
+`praxis-gateway:experimental`) and writes `.env` (`GATEWAY_IMAGE`, `PRAXIS_CONFIG`,
+`PRAXIS_POLICY_CONFIG_PATH`). `docker-compose.yml` just runs `${GATEWAY_IMAGE}`
+with `command: ["-c", "/etc/praxis/praxis-ai.yaml"]`.
 
 **Upstream services:**
 - `inference-sim` (8000) - llm-d-inference-sim, returns real token usage
 - `mock-llm` (1080) - MockServer with multi-provider LLM mocking
 - `jwt-issuer` (8888) - Static JWKS server for RS256 JWT tokens
 
-**No health checks** - Services start immediately (matches K8s setup)
+**No health checks** defined in compose — services start immediately.
 
 ## Build System
 
-### Multi-Stage Dockerfile
+### Basic build — `build/build-basic.sh`
 
-**Stage 1**: Source fetcher
-- Clones `praxis-proxy/ai` from GitHub (or uses local path)
-- Controlled by `PRAXIS_AI_SOURCE` (git:main, git:v0.1.0, path:/workspace/ai)
+- Pulls the released prebuilt image at a pinned tag (`AI_IMAGE`, default
+  `ghcr.io/praxis-proxy/ai:0.9`), retags it `praxis-gateway:basic`. No compile.
+- The released image runs as **non-root** (`praxis:praxis`) and ships
+  `ENTRYPOINT=["praxis-ai"]` with **no default CMD** — compose supplies
+  `command: ["-c", "/etc/praxis/praxis-ai.yaml"]`.
+- Writes `.env` selecting `basic.yaml`.
 
-**Stage 2**: Ratelimit patches (optional)
-- When `APPLY_RATELIMIT_PATCHES=true`
-- Vendors `praxis-proxy/policy` main + `praxis-proxy/praxis` v0.7.5
-- Forward-ports core to policy 0.5.0 API
-- Adds #1478 host wiring for `ratelimit.post_identity` hook
-- **Implemented**: `build/praxis/apply-experimental-ratelimit-patches.sh` (ported from K8s 265-line script)
+### Experimental build — `build/build-experimental.sh`
 
-**Stage 3**: Builder
-- Rust compilation with `PRAXIS_FEATURES`
-- Common: `full,token-rate-limit-filter`
-- Experimental: `full,experimental-ratelimit` (requires patches)
+- Runs `docker build ./build/praxis` with `PRAXIS_FEATURES=full,experimental-ratelimit`,
+  `APPLY_RATELIMIT_PATCHES=true`, `PRAXIS_AI_SOURCE` (default `git:main`),
+  tags `praxis-gateway:experimental`. Writes `.env` selecting
+  `ratelimit-limitador.yaml` + `ratelimit-policy.yaml`.
 
-**Stage 4**: Runtime
-- Debian bookworm-slim
-- Binary + CA certs
-- **Runs as root** (requires `allow_root: true` in config)
+The multi-stage Dockerfile (`build/praxis/Dockerfile`) is used only by the
+experimental build:
+
+**Stage 1 (source-fetcher)**: clones `praxis-proxy/ai` per `PRAXIS_AI_SOURCE`.
+**Stage 2 (ratelimit-patches-prep)**: runs `apply-experimental-ratelimit-patches.sh`
+(vendors policy main + core v0.7.5, forward-ports core to the 0.5.0 API, adds #1478
+host wiring for `ratelimit.post_identity`).
+**Stage 3 (builder)**: `cargo build --release --features="${PRAXIS_FEATURES}"`.
+**Stage 4 (runtime)**: Debian bookworm-slim, binary + CA certs, **runs as root**
+(config sets `allow_root: true`).
 
 ### Experimental-Ratelimit Build Process
 
-When `APPLY_RATELIMIT_PATCHES=true`, the build:
+The experimental build runs `apply-experimental-ratelimit-patches.sh`, which:
 
 1. **Vendors praxis-policy main** (merged PR #178 with ratelimit plugin)
 2. **Relabels 0.5.0 → 0.4.1** (satisfies core's ^0.4.1 dependency)
@@ -67,34 +85,21 @@ When `APPLY_RATELIMIT_PATCHES=true`, the build:
 
 **Why needed**: The `ratelimit/limitador` plugin lives on policy engine 0.5.0 (merged to main), which has API changes incompatible with core v0.7.5. The patches forward-port core to work with 0.5.0 and add the minimal #1478 host integration (post-identity hook invocation).
 
-### Source Specifications
+### Source Specification (experimental build only)
 
-**Format**: `<type>:<value>`
-- `crate:0.7.5` - Published crate version
-- `git:main` - GitHub branch/tag/commit
-- `path:/workspace/ai` - Local checkout (dev mode)
+`PRAXIS_AI_SOURCE` controls the `praxis-ai` ref the experimental build clones
+(`git:main`, `git:<tag>`, `git:<commit>`). Core (v0.7.5) and policy (main) refs are
+pinned inside the Dockerfile / patch script. The basic build has no source spec —
+it pulls a prebuilt image by tag (`AI_IMAGE`).
 
 ## Configuration
 
-### Config 1: token-rate-limit.yaml (Default)
+### Config 1: basic.yaml (Basic build / default runtime)
 
-**Filter chain**: 
-```
-router → model_to_header → token_rate_limit → token_count → access_log → load_balancer
-```
+**Filter chain**: `router → access_log → load_balancer`
 
-**Key settings:**
-- `allow_root: true` - Docker runs as root by default
-- `allow_private_upstreams: true` - Cluster Service IPs are private
-- `x-tier` header - Tier selection (gold/silver/enterprise/basic)
-- `x-model` header - Promoted from request body by `model_to_header`
-
-**Tiered budgets:**
-- Enterprise: 1B tok/hr (bypass)
-- Gold + gpt-4o: 20k tok/min (500 reserved)
-- Gold + other: 12k tok/min
-- Silver: 3k tok/min
-- Default: 1M tok/min (max_tokens estimation, fallback=50)
+Minimal proxy using only filters present in the released image. No rate limiting;
+a tunable baseline. Used by `./build/build-basic.sh`.
 
 ### Config 2: ratelimit-limitador.yaml (Experimental)
 
@@ -125,8 +130,8 @@ policy → router → access_log → load_balancer
 - Enterprise: exempt (no matching limit)
 
 **Build requirements:**
-- `APPLY_RATELIMIT_PATCHES=true` - Vendors policy main + core v0.7.5, adds #1478 wiring
-- `PRAXIS_FEATURES=full,experimental-ratelimit`
+- Built via `./build/build-experimental.sh` (sets `PRAXIS_FEATURES=full,experimental-ratelimit`
+  and `APPLY_RATELIMIT_PATCHES=true`; vendors policy main + core v0.7.5, adds #1478 wiring)
 
 **Caveats:**
 - **Request-count only** (not token-denominated) - runs pre-body
@@ -141,27 +146,23 @@ policy → router → access_log → load_balancer
 
 **Key helpers:**
 - `get_token <tier>` - Load JWT from `jwt/tokens/<tier>.jwt`
-- `post_chat <tier> [model] [max_tokens]` - Send chat completion with tier header
+- `post_chat <tier> [model] [max_tokens]` - Send chat completion with the tier's JWT
 - `post_chat_code <tier> [model] [max_tokens]` - Just return HTTP code
 - `hammer <tier> <count> [model]` - Burst N requests, return "200s 429s others"
 - `get_metrics` / `get_metric <name>` - Scrape Prometheus metrics
 
-**Important**: All functions add **`x-tier` header** automatically - config uses headers, not JWT claims for tier selection.
+**Tier selection**: the `ratelimit-limitador.yaml` config keys on the **JWT `tier`
+claim** (resolved post-identity), not a request header. The helpers send the JWT
+via `Authorization: Bearer`; they also set an `x-tier` header, which this config
+ignores.
 
 ### Running Tests
 
-```bash
-make test           # Run tests for current config
-make gateway        # Rebuild gateway
-make deploy-gateway # Restart gateway
-make logs           # Tail gateway logs
-```
+`make test` dispatches on the active `PRAXIS_CONFIG`:
+- `basic.yaml` → no tests (minimal proxy)
+- `ratelimit-limitador.yaml` → `test/test-ratelimit-limitador.sh` (M1 + M5)
 
-**Test scripts:**
-- `test/test-token-rate-limit.sh` - M1-M7 validation for token-rate-limit.yaml
-- `test/test-ratelimit-limitador.sh` - M1+M5 validation for ratelimit-limitador.yaml
-
-**Test output**: Uses color codes (`log_info`, `log_success`, `log_error`) - functions that parse output send logs to stderr.
+**Test output**: color codes (`log_info`, `log_success`, `log_error`); functions that parse output send logs to stderr.
 
 ## JWT System
 
@@ -189,11 +190,11 @@ make logs           # Tail gateway logs
 
 ### Tests return all "other" (not 200/429)
 **Symptom**: `hammer()` shows `??????????`  
-**Fix**: Ensure test functions send `x-tier` header (config keys on header, not JWT claim)
+**Fix**: Gateway not reachable or tokens missing — check it's deployed (`docker compose ps`) and run `make jwt-tokens`.
 
-### Health checks fail
-**Symptom**: Services stuck in "health: starting"  
-**Fix**: Remove health checks - not needed, K8s setup doesn't use them
+### Ratelimit requests all 401 / denied
+**Symptom**: Every request to the experimental build is rejected  
+**Fix**: The JWT must carry a `tier` claim the policy keys on (`notier.jwt` is denied by design); verify JWKS is reachable at `http://jwt-issuer/jwks.json`.
 
 ### No metrics visible
 **Symptom**: `/metrics` returns 404 or empty  
@@ -201,48 +202,34 @@ make logs           # Tail gateway logs
 
 ## Development Workflow
 
-### Switching Configurations
+### Switching Between Builds
 
-**Quick switch to experimental-ratelimit**:
-```bash
-cp .env.ratelimit-limitador .env
-make gateway        # Build with patches
-make deploy-gateway # Deploy
-./test/test-ratelimit-limitador.sh
-```
+Re-run the other build script; it retags the image and rewrites `.env`, then redeploy:
 
-**Quick switch back to token-rate-limit (default)**:
 ```bash
-cp .env.example .env
-make gateway
+# Switch to experimental-ratelimit
+./build/build-experimental.sh   # or: make gateway-experimental
 make deploy-gateway
-make test
+./test/test-ratelimit-limitador.sh
+
+# Switch back to basic (released image, minimal proxy)
+./build/build-basic.sh          # or: make gateway-basic
+make deploy-gateway
 ```
 
-### Changing Configuration
+### Changing the runtime config (no rebuild)
 
-1. Edit config file: `config/praxis/token-rate-limit.yaml`
+The config is bind-mounted, so edits apply on restart:
+
+1. Edit config file (e.g. `config/praxis/basic.yaml`)
 2. Restart gateway: `docker compose restart praxis-gateway`
 3. Test: `make test`
 
-### Changing Features
+### Pinning different sources
 
-1. Edit `.env`: `PRAXIS_FEATURES=full,experimental-ratelimit`
-2. Rebuild: `make gateway`
-3. Restart: `make deploy-gateway`
-
-### Testing with Different Sources
-
-```bash
-# Use local checkout
-PRAXIS_AI_SOURCE=path:/workspace/praxis-ai make gateway
-
-# Use specific commit
-PRAXIS_AI_SOURCE=git:abc123 make gateway
-
-# Use published crate
-PRAXIS_CORE_SOURCE=crate:0.7.5 make gateway
-```
+- Basic: bump the tag — `AI_IMAGE=ghcr.io/praxis-proxy/ai:<tag> ./build/build-basic.sh`
+- Experimental: pin the `praxis-ai` ref — `PRAXIS_AI_SOURCE=git:<ref> ./build/build-experimental.sh`
+  (core/policy refs are pinned in the Dockerfile / patch script)
 
 ### Debugging
 
@@ -250,11 +237,8 @@ PRAXIS_CORE_SOURCE=crate:0.7.5 make gateway
 # Gateway logs
 docker compose logs praxis-gateway
 
-# Accounting logs (token rate limit)
-docker compose logs praxis-gateway | grep accounting
-
 # Metrics
-curl http://localhost:9901/metrics | grep praxis_trl
+curl http://localhost:9901/metrics
 
 # Test request with details
 TOKEN=$(cat jwt/tokens/gold.jwt)
@@ -269,54 +253,64 @@ curl -v http://localhost:8080/v1/chat/completions \
 
 ```
 praxis-playground/
-├── docker-compose.yml       # Services (no health checks)
-├── .env.example             # Config template
-├── Makefile                 # Targets: setup, gateway, deploy-gateway, test
-├── build/praxis/
-│   ├── Dockerfile           # Multi-stage build
-│   └── apply-experimental-ratelimit-patches.sh
-├── config/praxis/
-│   └── token-rate-limit.yaml  # M1-M7 verified
+├── docker-compose.yml          # Service definitions (gateway runs ${GATEWAY_IMAGE})
+├── .env.example                # Reference for the .env the build scripts generate
+├── Makefile                    # Convenience targets
+├── README.md                   # User-facing overview
+├── build/
+│   ├── build-basic.sh          # BASIC build: pull released image
+│   ├── build-experimental.sh   # EXPERIMENTAL build: compile experimental-ratelimit
+│   ├── praxis/
+│   │   ├── Dockerfile          # Multi-stage build (used by build-experimental.sh)
+│   │   └── apply-experimental-ratelimit-patches.sh # Patches for experimental-ratelimit (✓ ported)
+│   └── jwt-issuer/
+│       ├── Dockerfile          # Nginx serving JWKS
+│       └── nginx.conf
+├── config/
+│   ├── praxis/
+│   │   ├── basic.yaml                  # Basic build config (minimal proxy, released image)
+│   │   ├── ratelimit-limitador.yaml    # Ratelimit plugin config (M1+M5 ✅)
+│   │   └── ratelimit-policy.yaml       # Ratelimit policy doc
+│   └── mockserver/
+│       └── expectations.json           # LLM response mocking
 ├── jwt/
-│   ├── generate.sh          # RS256 token generation
-│   └── tokens/              # Generated JWTs (gitignored)
+│   ├── generate.sh             # Token + JWKS generation
+│   ├── README.md               # JWT documentation
+│   └── .gitignore              # Ignore generated keys/tokens
 └── test/
-    ├── lib.sh               # Test helpers
-    ├── test-token-rate-limit.sh  # M1-M7 validation
-    └── run-all.sh           # Test runner
+    ├── lib.sh                          # Shared test helpers
+    ├── run-all.sh                      # Test runner (dispatches on PRAXIS_CONFIG)
+    └── test-ratelimit-limitador.sh     # Ratelimit plugin M1+M5 tests
 ```
 
-## Key Differences from K8s Setup
+## Makefile Targets
 
-**Simpler:**
-- ✅ No kind cluster, kubectl, helm, Istio
-- ✅ No port-forwarding (direct localhost access)
-- ✅ Faster iteration (~30s rebuild vs 5min cluster setup)
-- ✅ 4 containers vs 20+ pods
+```
+make help                  # Show all targets
+make setup                 # Full setup (jwt-tokens + basic gateway + deploy)
+make jwt-tokens            # Generate JWT tokens and JWKS
+make gateway-basic         # Build BASIC gateway (pull released image)
+make gateway-experimental  # Build EXPERIMENTAL gateway (compile experimental-ratelimit)
+make gateway               # Alias for gateway-basic
+make deploy-gateway        # Stop and start gateway (restart)
+make up                    # Start all services
+make down                  # Stop all services
+make logs                  # Tail gateway logs
+make clean                 # Stop and remove all (including volumes)
+make test                  # Run tests for current configuration
+```
 
-**Same capabilities:**
-- ✅ All experimental features buildable
-- ✅ Same upstream mocks
-- ✅ Same JWT system
-- ✅ Same acceptance tests (M1-M7)
+## Scope
 
-**Removed:**
-- ❌ Standalone Limitador (only embedded, via ratelimit plugin)
-- ❌ Quota plugin (only ratelimit plugin supported)
-- ❌ Kuadrant TokenRateLimitPolicy comparison
-- ❌ Health checks (not needed)
+Not included: token rate limiting (`token_rate_limit`, gated out of every build
+here), standalone Limitador (only the embedded in-process Limitador via the
+ratelimit plugin), and the quota plugin.
 
 ## Docker Compose v2
 
-**This project uses `docker compose` (v2 syntax)**, not `docker-compose` (v1).
-
-All Makefile targets and documentation use the v2 command.
+Uses `docker compose` (v2), not `docker-compose` (v1).
 
 ## TODO
 
-- [ ] Create `rate-limit.yaml` (simple request-count) - **SKIPPED** (not needed, token-rate-limit + ratelimit-limitador cover use cases)
-- [x] Create `ratelimit-limitador.yaml` + `ratelimit-policy.yaml` - **DONE**
-- [x] Port full ratelimit patches (265-line script) - **DONE** (see `build/praxis/apply-experimental-ratelimit-patches.sh`)
-- [x] Add test scripts for other configs - **DONE** (`test/test-ratelimit-limitador.sh`)
 - [ ] Document MockServer expectations format
-- [ ] Test full build with `APPLY_RATELIMIT_PATCHES=true`
+- [ ] Verify the experimental build end-to-end (`./build/build-experimental.sh`)

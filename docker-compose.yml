@@ -36,22 +36,22 @@ services:
     networks:
       - praxis-net
 
-  # --- Praxis Gateway (configurable) ---
+  # --- Praxis Gateway ---
+  # The image is produced by one of the two build scripts, which also write
+  # GATEWAY_IMAGE + PRAXIS_CONFIG into .env:
+  #   ./build/build-basic.sh         -> praxis-gateway:basic
+  #   ./build/build-experimental.sh  -> praxis-gateway:experimental
 
   praxis-gateway:
-    build:
-      context: ./build/praxis
-      args:
-        PRAXIS_FEATURES: ${PRAXIS_FEATURES:-full,token-rate-limit-filter}
-        PRAXIS_AI_SOURCE: ${PRAXIS_AI_SOURCE:-git:main}
-        PRAXIS_CORE_SOURCE: ${PRAXIS_CORE_SOURCE:-crate:0.7.5}
-        PRAXIS_POLICY_SOURCE: ${PRAXIS_POLICY_SOURCE:-crate:0.4.1}
-        APPLY_RATELIMIT_PATCHES: ${APPLY_RATELIMIT_PATCHES:-false}
+    image: ${GATEWAY_IMAGE:-praxis-gateway:basic}
+    # The released image ships ENTRYPOINT=["praxis-ai"] with no default CMD,
+    # so point it at the mounted config explicitly (harmless for both images).
+    command: ["-c", "/etc/praxis/praxis-ai.yaml"]
     volumes:
-      - ./config/praxis/${PRAXIS_CONFIG:-token-rate-limit.yaml}:/etc/praxis/praxis-ai.yaml:ro
+      - ./config/praxis/${PRAXIS_CONFIG:-basic.yaml}:/etc/praxis/praxis-ai.yaml:ro
       # Policy config for PPE-based configs (will be empty mount if not set)
       - type: bind
-        source: ${PRAXIS_POLICY_CONFIG_PATH:-./config/praxis/token-rate-limit.yaml}
+        source: ${PRAXIS_POLICY_CONFIG_PATH:-./config/praxis/basic.yaml}
         target: /etc/praxis/policy.yaml
         read_only: true
     ports:
