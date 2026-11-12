@@ -1,6 +1,9 @@
 # Praxis Playground - Developer Guide
 
-A **Docker Compose-based playground** for building and testing the Praxis AI gateway's rate-limiting features.
+A playground for building and testing the Praxis AI gateway's rate-limiting
+features. Supporting services run in Docker Compose. The gateway runs either as a
+released image **in compose** (basic build) or as a **host-compiled binary**
+(experimental build).
 
 ## Project Purpose
 
@@ -23,15 +26,20 @@ truth for versions/features — there are no generic feature/source knobs):
   minimal `router → access_log → load_balancer` proxy). No local compile.
   **The released image does NOT include `token_rate_limit` or `model_to_header`**
   (both gated behind the `token-rate-limit-filter` feature).
-- **Experimental** — `./build/build-experimental.sh` compiles from source with
-  only `experimental-ratelimit` (PPE plugin, embedded Limitador, M1+M5), runs
-  `ratelimit-limitador.yaml` + `ratelimit-policy.yaml`. Vendors policy + core and
-  applies patches (~5-10 min).
+- **Experimental** — `./build/build-experimental.sh` compiles **on the host** with
+  only `experimental-ratelimit` (PPE plugin, embedded Limitador, M1+M5), and
+  `./build/run-experimental.sh` runs the binary on the host against
+  `ratelimit-limitador.yaml` + `ratelimit-policy.yaml`. Builds praxis-ai main,
+  which pins core v0.8.0 (-> policy v0.6.0) from crates.io — no vendoring. A thin
+  overlay only adds `panic="unwind"` + a feature passthrough (~5-10 min).
 
-Each script produces a tagged image (`praxis-gateway:basic` /
-`praxis-gateway:experimental`) and writes `.env` (`GATEWAY_IMAGE`, `PRAXIS_CONFIG`,
-`PRAXIS_POLICY_CONFIG_PATH`). `docker-compose.yml` just runs `${GATEWAY_IMAGE}`
-with `command: ["-c", "/etc/praxis/praxis-ai.yaml"]`.
+The **basic** build retags the released image (`praxis-gateway:basic`) and writes
+`.env` with `GATEWAY_IMAGE` / `PRAXIS_CONFIG` / `PRAXIS_POLICY_CONFIG_PATH`;
+`docker-compose.yml` runs `${GATEWAY_IMAGE}` as the `praxis-gateway` service. The
+**experimental** build writes `.env` with `GATEWAY_BIN` (the compiled binary path)
+and `PRAXIS_CONFIG`, and does NOT use the compose `praxis-gateway` service — the
+host binary is launched by `run-experimental.sh`, which only brings up the
+supporting services in compose.
 
 **Upstream services:**
 - `inference-sim` (8000) - llm-d-inference-sim, returns real token usage
@@ -51,46 +59,61 @@ with `command: ["-c", "/etc/praxis/praxis-ai.yaml"]`.
   `command: ["-c", "/etc/praxis/praxis-ai.yaml"]`.
 - Writes `.env` selecting `basic.yaml`.
 
-### Experimental build — `build/build-experimental.sh`
+### Experimental build — `build/build-experimental.sh` (HOST build)
 
-- Runs `docker build ./build/praxis` with `PRAXIS_FEATURES=full,experimental-ratelimit`,
-  `APPLY_RATELIMIT_PATCHES=true`, `PRAXIS_AI_SOURCE` (default `git:main`),
-  tags `praxis-gateway:experimental`. Writes `.env` selecting
-  `ratelimit-limitador.yaml` + `ratelimit-policy.yaml`.
+A plain host build — no Docker image for the gateway. Steps:
 
-The multi-stage Dockerfile (`build/praxis/Dockerfile`) is used only by the
-experimental build:
+1. Resolve a `praxis-ai` checkout: clone `PRAXIS_AI_REPO`@`PRAXIS_AI_REF` (default
+   `main`) into `build/.praxis-ai` (gitignored), or reuse `PRAXIS_AI_DIR`. Core and
+   policy are NOT cloned — praxis-ai pins them as crates.io versions (core v0.8.0 ->
+   policy v0.6.0).
+2. Sanity-check the host toolchain (warns if `rustc < 1.92`, policy 0.6.0's MSRV, or
+   if `protoc`/`cmake`/`pkg-config` are missing).
+3. Apply the overlay (`apply-experimental-ratelimit-patches.sh`): `panic="unwind"` +
+   a `policy-experimental-ratelimit` feature passthrough — no vendoring.
+4. `cargo build --release --features full,experimental-ratelimit --bin praxis-ai`.
+5. Write `.env` with `GATEWAY_BIN` (path to the compiled binary) and
+   `PRAXIS_CONFIG=ratelimit-limitador.yaml`.
 
-**Stage 1 (source-fetcher)**: clones `praxis-proxy/ai` per `PRAXIS_AI_SOURCE`.
-**Stage 2 (ratelimit-patches-prep)**: runs `apply-experimental-ratelimit-patches.sh`
-(vendors policy main + core v0.7.5, forward-ports core to the 0.5.0 API, adds #1478
-host wiring for `ratelimit.post_identity`).
-**Stage 3 (builder)**: `cargo build --release --features="${PRAXIS_FEATURES}"`.
-**Stage 4 (runtime)**: Debian bookworm-slim, binary + CA certs, **runs as root**
-(config sets `allow_root: true`).
+### Running it — `build/run-experimental.sh {start|stop|status}`
+
+- `start`: `docker compose up -d inference-sim mock-llm jwt-issuer` (supporting
+  services only), health-checks them, then runs `$GATEWAY_BIN` on the host **from
+  `config/praxis/`** (so the policy `config_path` resolves), backgrounded with
+  `.gateway-local.pid` + `gateway-local.log`, and waits on `:9901/healthy`.
+- `stop`: kills the pidfile process and `docker compose stop`s the supporting services.
 
 ### Experimental-Ratelimit Build Process
 
-The experimental build runs `apply-experimental-ratelimit-patches.sh`, which:
+As of core **v0.8.0** (which pins policy **v0.6.0**) the plugin and its host wiring
+are released, so the old vendoring/relabel/forward-port is gone. What is now
+released and wired for us:
 
-1. **Vendors praxis-policy main** (merged PR #178 with ratelimit plugin)
-2. **Relabels 0.5.0 → 0.4.1** (satisfies core's ^0.4.1 dependency)
-3. **Vendors praxis-core v0.7.5**
-4. **Patches core's policy filter** (three changes):
-   - **(A)** Import `Credential` + `HOOK_RATELIMIT_POST_IDENTITY`
-   - **(B)** Compile fix: `source_header` → `Credential::Header`
-   - **(C)** #1478 host wiring: invoke `ratelimit.post_identity` after identity resolution
-5. **Overlays server/Cargo.toml**: adds `experimental-ratelimit` feature
-6. **Overlays root Cargo.toml**: adds `[patch.crates-io]` redirects, sets `panic = "unwind"`
+- policy v0.6.0 ships the `ratelimit/limitador` plugin behind `experimental-ratelimit`,
+  re-exposed as `ppe/experimental-ratelimit`.
+- core v0.8.0's policy filter natively invokes `ratelimit.{pre,post}_identity`
+  (praxis#1478 is merged) and exposes `praxis-filter/policy-experimental-ratelimit`.
+- praxis-ai main already pins core v0.8.0 (-> policy v0.6.0) from crates.io.
 
-**Why needed**: The `ratelimit/limitador` plugin lives on policy engine 0.5.0 (merged to main), which has API changes incompatible with core v0.7.5. The patches forward-port core to work with 0.5.0 and add the minimal #1478 host integration (post-identity hook invocation).
+So `apply-experimental-ratelimit-patches.sh` now only overlays praxis-ai's own
+Cargo.toml with the two things still missing there:
+
+1. **`[profile.release] panic = "unwind"`** — the plugin's factory refuses to load
+   on a `panic="abort"` build (its handler uses `catch_unwind` to contain Limitador's
+   panic on a bad CEL condition). ai main ships `panic="abort"`.
+2. **A `policy-experimental-ratelimit` feature passthrough** — ai's `policy-engine`
+   enables the stable builtins granularly and deliberately omits the experimental
+   limiter, so it must be opted in. Added at both ai layers (filters + server),
+   forwarding to `praxis-filter/policy-experimental-ratelimit`.
 
 ### Source Specification (experimental build only)
 
-`PRAXIS_AI_SOURCE` controls the `praxis-ai` ref the experimental build clones
-(`git:main`, `git:<tag>`, `git:<commit>`). Core (v0.7.5) and policy (main) refs are
-pinned inside the Dockerfile / patch script. The basic build has no source spec —
-it pulls a prebuilt image by tag (`AI_IMAGE`).
+`PRAXIS_AI_REF` controls the `praxis-ai` ref the experimental build checks out
+(default `main`; a branch or commit SHA); it pins core v0.8.0 / policy v0.6.0
+transitively via its own crates.io version deps. `PRAXIS_AI_DIR` reuses an existing
+checkout instead of cloning. For a reproducible demo build, pin `PRAXIS_AI_REF` to a
+specific commit. The basic build has no source spec — it pulls a prebuilt image by
+tag (`AI_IMAGE`).
 
 ## Configuration
 
@@ -108,14 +131,16 @@ a tunable baseline. Used by `./build/build-basic.sh`.
 policy → router → access_log → load_balancer
 ```
 
-**Key settings:**
-- `allow_root: true` - Docker runs as root by default
-- `allow_private_upstreams: true` - Cluster Service IPs are private
-- `allow_private_idp: true` - JWKS fetch from Docker service
-- Policy document: `ratelimit-policy.yaml` (mounted at `/etc/praxis/policy.yaml`)
+**Key settings (host-run):**
+- `allow_private_upstreams` / `allow_private_endpoints: true` - loopback upstreams
+- `allow_private_idp: true` - JWKS fetched over loopback
+- No `allow_root` - the host binary runs as your user
+- Policy document: `config_path: ratelimit-policy.yaml` (bare sibling name; the
+  gateway is run from `config/praxis/`)
+- Upstreams point at `127.0.0.1:1080` (mock-llm's compose port map)
 
 **Policy plugins:**
-- **identity/jwt**: RS256 verification via JWKS at `http://jwt-issuer/jwks.json`
+- **identity/jwt**: RS256 verification via JWKS at `http://localhost:8888/jwks.json`
   - Exposes `tier` claim to ratelimit plugin
   - Unauthenticated requests: 401
 - **ratelimit/limitador**: Embedded in-memory Limitador
@@ -130,8 +155,10 @@ policy → router → access_log → load_balancer
 - Enterprise: exempt (no matching limit)
 
 **Build requirements:**
-- Built via `./build/build-experimental.sh` (sets `PRAXIS_FEATURES=full,experimental-ratelimit`
-  and `APPLY_RATELIMIT_PATCHES=true`; vendors policy main + core v0.7.5, adds #1478 wiring)
+- Built via `./build/build-experimental.sh` on the host (`cargo build --release
+  --features full,experimental-ratelimit`; praxis-ai main pins core v0.8.0 / policy
+  v0.6.0 from crates.io; applies the panic=unwind + feature overlay). Needs Rust
+  >= 1.92 and `protobuf-compiler`/`cmake`/`pkg-config`/`libssl-dev` on the host.
 
 **Caveats:**
 - **Request-count only** (not token-denominated) - runs pre-body
@@ -176,25 +203,28 @@ ignores.
 - `sub`: user-{tier}
 - `tier`: gold/silver/enterprise/basic (absent in `notier.jwt`)
 
-**JWKS endpoint**: `http://jwt-issuer/jwks.json` (served by nginx)
+**JWKS endpoint**: `http://localhost:8888/jwks.json` (nginx in compose; `jwt-issuer`
+is the internal service name, reached from the host via the 8888:80 port map)
 
 ## Common Issues
 
-### Gateway refuses to start
-**Symptom**: "Praxis refuses to run as root (UID 0)"  
-**Fix**: Add `allow_root: true` to config's `insecure_options`
+### Gateway refuses to start ("plugin refuses to load on an aborting build")
+**Symptom**: the experimental gateway exits at startup citing `panic = "unwind"`
+**Fix**: rebuild via `./build/build-experimental.sh` — the overlay sets
+`[profile.release] panic = "unwind"`, required by the ratelimit plugin's factory.
 
 ### 502 Bad Gateway
-**Symptom**: All requests fail with 502  
-**Fix**: Add `allow_private_upstreams: true` to config (Docker network IPs are private)
+**Symptom**: All requests fail with 502
+**Fix**: ensure `allow_private_upstreams: true` (loopback upstreams) and that the
+supporting services are up (`./build/run-experimental.sh status`).
 
 ### Tests return all "other" (not 200/429)
-**Symptom**: `hammer()` shows `??????????`  
-**Fix**: Gateway not reachable or tokens missing — check it's deployed (`docker compose ps`) and run `make jwt-tokens`.
+**Symptom**: `hammer()` shows `??????????`
+**Fix**: Gateway not reachable or tokens missing — check `./build/run-experimental.sh status` and run `make jwt-tokens`.
 
 ### Ratelimit requests all 401 / denied
-**Symptom**: Every request to the experimental build is rejected  
-**Fix**: The JWT must carry a `tier` claim the policy keys on (`notier.jwt` is denied by design); verify JWKS is reachable at `http://jwt-issuer/jwks.json`.
+**Symptom**: Every request to the experimental build is rejected
+**Fix**: The JWT must carry a `tier` claim the policy keys on (`notier.jwt` is denied by design); verify JWKS is reachable at `http://localhost:8888/jwks.json`.
 
 ### No metrics visible
 **Symptom**: `/metrics` returns 404 or empty  
@@ -204,38 +234,41 @@ ignores.
 
 ### Switching Between Builds
 
-Re-run the other build script; it retags the image and rewrites `.env`, then redeploy:
+The two builds run differently — basic is a compose service, experimental is a host
+binary:
 
 ```bash
-# Switch to experimental-ratelimit
+# Experimental-ratelimit (host binary)
 ./build/build-experimental.sh   # or: make gateway-experimental
-make deploy-gateway
-./test/test-ratelimit-limitador.sh
+make run-experimental           # start deps (compose) + the host gateway
+make test
+make stop-experimental
 
-# Switch back to basic (released image, minimal proxy)
+# Basic (released image, minimal proxy, in compose)
 ./build/build-basic.sh          # or: make gateway-basic
 make deploy-gateway
 ```
 
 ### Changing the runtime config (no rebuild)
 
-The config is bind-mounted, so edits apply on restart:
-
-1. Edit config file (e.g. `config/praxis/basic.yaml`)
-2. Restart gateway: `docker compose restart praxis-gateway`
-3. Test: `make test`
+- **Basic (compose)**: config is bind-mounted — edit `config/praxis/basic.yaml`,
+  then `docker compose restart praxis-gateway`.
+- **Experimental (host)**: edit `config/praxis/ratelimit-limitador.yaml` /
+  `ratelimit-policy.yaml`, then `make stop-experimental && make run-experimental`
+  (no recompile needed).
 
 ### Pinning different sources
 
 - Basic: bump the tag — `AI_IMAGE=ghcr.io/praxis-proxy/ai:<tag> ./build/build-basic.sh`
-- Experimental: pin the `praxis-ai` ref — `PRAXIS_AI_SOURCE=git:<ref> ./build/build-experimental.sh`
-  (core/policy refs are pinned in the Dockerfile / patch script)
+- Experimental: pin the `praxis-ai` ref — `PRAXIS_AI_REF=<sha> ./build/build-experimental.sh`
+  (core v0.8.0 / policy v0.6.0 are pinned transitively by praxis-ai's crates.io deps)
 
 ### Debugging
 
 ```bash
 # Gateway logs
-docker compose logs praxis-gateway
+docker compose logs praxis-gateway   # basic (compose)
+tail -f gateway-local.log            # experimental (host)  (make logs-experimental)
 
 # Metrics
 curl http://localhost:9901/metrics
@@ -253,16 +286,16 @@ curl -v http://localhost:8080/v1/chat/completions \
 
 ```
 praxis-playground/
-├── docker-compose.yml          # Service definitions (gateway runs ${GATEWAY_IMAGE})
+├── docker-compose.yml          # Supporting services + basic gateway (${GATEWAY_IMAGE})
 ├── .env.example                # Reference for the .env the build scripts generate
 ├── Makefile                    # Convenience targets
 ├── README.md                   # User-facing overview
 ├── build/
-│   ├── build-basic.sh          # BASIC build: pull released image
-│   ├── build-experimental.sh   # EXPERIMENTAL build: compile experimental-ratelimit
+│   ├── build-basic.sh          # BASIC build: pull released image (compose)
+│   ├── build-experimental.sh   # EXPERIMENTAL build: host cargo build
+│   ├── run-experimental.sh     # start|stop|status the host experimental gateway
 │   ├── praxis/
-│   │   ├── Dockerfile          # Multi-stage build (used by build-experimental.sh)
-│   │   └── apply-experimental-ratelimit-patches.sh # Patches for experimental-ratelimit (✓ ported)
+│   │   └── apply-experimental-ratelimit-patches.sh # Thin overlay (panic=unwind + feature)
 │   └── jwt-issuer/
 │       ├── Dockerfile          # Nginx serving JWKS
 │       └── nginx.conf
@@ -290,12 +323,15 @@ make help                  # Show all targets
 make setup                 # Full setup (jwt-tokens + basic gateway + deploy)
 make jwt-tokens            # Generate JWT tokens and JWKS
 make gateway-basic         # Build BASIC gateway (pull released image)
-make gateway-experimental  # Build EXPERIMENTAL gateway (compile experimental-ratelimit)
+make gateway-experimental  # Build EXPERIMENTAL gateway on the HOST (cargo build)
+make run-experimental      # Start host experimental gateway + supporting services
+make stop-experimental     # Stop host experimental gateway + supporting services
 make gateway               # Alias for gateway-basic
-make deploy-gateway        # Stop and start gateway (restart)
-make up                    # Start all services
-make down                  # Stop all services
-make logs                  # Tail gateway logs
+make deploy-gateway        # Restart the BASIC (compose) gateway
+make up                    # Start all compose services
+make down                  # Stop all compose services
+make logs                  # Tail basic (compose) gateway logs
+make logs-experimental     # Tail host experimental gateway log
 make clean                 # Stop and remove all (including volumes)
 make test                  # Run tests for current configuration
 ```

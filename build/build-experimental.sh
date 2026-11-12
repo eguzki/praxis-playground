@@ -1,51 +1,94 @@
 #!/usr/bin/env bash
 #
-# EXPERIMENTAL build - gateway with ONLY the experimental-ratelimit feature.
+# EXPERIMENTAL build - HOST build of the gateway with the experimental-ratelimit
+# feature (PPE ratelimit/limitador plugin, embedded in-memory Limitador).
 #
-# This compiles Praxis AI from source with the PPE ratelimit/limitador plugin
-# (embedded in-memory Limitador). The build vendors praxis-proxy/policy (main)
-# and praxis-proxy/praxis (v0.7.5) and applies the #1478 host-wiring patches
-# (see build/praxis/apply-experimental-ratelimit-patches.sh). Expect ~5-10 min.
+# The plugin and its host wiring are RELEASED: praxis-ai main pins core v0.8.0
+# (-> policy v0.6.0) from crates.io, so there is NO vendoring. We clone praxis-ai,
+# apply a thin overlay (panic="unwind" + a feature passthrough; see
+# build/praxis/apply-experimental-ratelimit-patches.sh), and `cargo build` on the
+# host. The binary runs on the host (NOT in docker compose); only the supporting
+# services (mock-llm, jwt-issuer) run in compose. Run it with:
+#   ./build/run-experimental.sh start
 #
 # Usage:
 #   ./build/build-experimental.sh
-#   PRAXIS_AI_SOURCE=git:main ./build/build-experimental.sh
+#   PRAXIS_AI_REF=<sha|branch> ./build/build-experimental.sh   # pin a praxis-ai rev
+#   PRAXIS_AI_DIR=/path/to/ai  ./build/build-experimental.sh   # reuse a checkout
+#
+# Prereqs on the host: git, a Rust toolchain >= 1.92 (policy 0.6.0 MSRV), and the
+# native build deps Limitador's tonic/prost graph needs: protobuf-compiler, cmake,
+# pkg-config, libssl-dev.
 #
 set -euo pipefail
 
 cd "$(dirname "$0")/.."   # repo root
+REPO_ROOT="$PWD"
 
-# --- Pinned sources for the experimental build ---
-# Core (v0.7.5) and policy (main) refs are pinned inside the Dockerfile /
-# apply-experimental-ratelimit-patches.sh; the praxis-ai ref is set here.
-PRAXIS_AI_SOURCE="${PRAXIS_AI_SOURCE:-git:main}"
-LOCAL_IMAGE="praxis-gateway:experimental"
+PRAXIS_AI_REPO="${PRAXIS_AI_REPO:-https://github.com/praxis-proxy/ai.git}"
+# For a reproducible demo build, pin this to a specific main commit.
+PRAXIS_AI_REF="${PRAXIS_AI_REF:-main}"
+PRAXIS_AI_DIR="${PRAXIS_AI_DIR:-$REPO_ROOT/build/.praxis-ai}"
+FEATURES="${FEATURES:-full,experimental-ratelimit}"
 
-echo "==> EXPERIMENTAL build: compiling experimental-ratelimit"
-echo "    praxis-ai source: ${PRAXIS_AI_SOURCE}"
-echo "    (vendors policy main + core v0.7.5, applies #1478 patches - ~5-10 min)"
-docker build \
-  --build-arg PRAXIS_FEATURES=full,experimental-ratelimit \
-  --build-arg PRAXIS_AI_SOURCE="${PRAXIS_AI_SOURCE}" \
-  --build-arg APPLY_RATELIMIT_PATCHES=true \
-  -t "${LOCAL_IMAGE}" \
-  ./build/praxis
+step() { printf "\n\033[1;34m==>\033[0m %s\n" "$*"; }
+die()  { printf "\033[1;31mERROR:\033[0m %s\n" "$*" >&2; exit 1; }
 
-echo "==> Selecting runtime config (writing .env)"
-cat > .env <<EOF
+# --- Toolchain / native deps checks ------------------------------------------
+command -v git   >/dev/null 2>&1 || die "git not found"
+command -v cargo >/dev/null 2>&1 || die "cargo not found - install Rust (rustup)"
+
+# Warn (don't fail) if the toolchain is older than policy 0.6.0's MSRV (1.92).
+rust_ver="$(rustc --version 2>/dev/null | awk '{print $2}')"
+rust_major="${rust_ver%%.*}"; rust_rest="${rust_ver#*.}"; rust_minor="${rust_rest%%.*}"
+if [ -n "${rust_minor:-}" ] && { [ "${rust_major:-0}" -lt 1 ] || { [ "${rust_major:-0}" -eq 1 ] && [ "${rust_minor:-0}" -lt 92 ]; }; }; then
+  printf "\033[1;33mWARN:\033[0m rustc %s < 1.92 (policy 0.6.0 MSRV); run \`rustup update\` if the build fails.\n" "$rust_ver" >&2
+fi
+missing=""
+for t in protoc cmake pkg-config; do command -v "$t" >/dev/null 2>&1 || missing="$missing $t"; done
+[ -n "$missing" ] && printf "\033[1;33mWARN:\033[0m missing native build deps:%s (needed by Limitador's tonic/prost graph)\n" "$missing" >&2
+
+# --- Resolve the praxis-ai checkout ------------------------------------------
+step "Resolving praxis-ai (${PRAXIS_AI_REPO} @ ${PRAXIS_AI_REF})"
+if [ -d "$PRAXIS_AI_DIR/.git" ]; then
+  git -C "$PRAXIS_AI_DIR" fetch --depth 1 origin "$PRAXIS_AI_REF"
+  git -C "$PRAXIS_AI_DIR" checkout -q FETCH_HEAD
+  printf "  reused %s\n" "$PRAXIS_AI_DIR"
+elif [ -d "$PRAXIS_AI_DIR" ] && [ -n "$(ls -A "$PRAXIS_AI_DIR" 2>/dev/null)" ]; then
+  printf "  using existing non-git checkout at %s (overlay reset may be skipped)\n" "$PRAXIS_AI_DIR"
+else
+  git clone --depth 1 --branch "$PRAXIS_AI_REF" "$PRAXIS_AI_REPO" "$PRAXIS_AI_DIR" 2>/dev/null \
+    || git clone "$PRAXIS_AI_REPO" "$PRAXIS_AI_DIR"
+  git -C "$PRAXIS_AI_DIR" checkout -q "$PRAXIS_AI_REF" 2>/dev/null || true
+  printf "  cloned into %s\n" "$PRAXIS_AI_DIR"
+fi
+
+# --- Apply the overlay (panic=unwind + feature passthrough) ------------------
+step "Applying experimental-ratelimit overlay"
+PRAXIS_AI_SOURCE_DIR="$PRAXIS_AI_DIR" "$REPO_ROOT/build/praxis/apply-experimental-ratelimit-patches.sh"
+
+# --- Build --------------------------------------------------------------------
+step "Building praxis-ai (release, --features $FEATURES) - first build ~5-10 min"
+( cd "$PRAXIS_AI_DIR" && cargo build --release --features "$FEATURES" --bin praxis-ai )
+GATEWAY_BIN="$PRAXIS_AI_DIR/target/release/praxis-ai"
+[ -x "$GATEWAY_BIN" ] || die "expected binary not found at $GATEWAY_BIN"
+
+# --- Record selection in .env -------------------------------------------------
+step "Writing .env"
+cat > "$REPO_ROOT/.env" <<EOF
 # Generated by build/build-experimental.sh - DO NOT EDIT BY HAND.
 # Re-run ./build/build-experimental.sh to regenerate.
 #
-# EXPERIMENTAL build: experimental-ratelimit (PPE plugin, embedded Limitador).
-GATEWAY_IMAGE=${LOCAL_IMAGE}
+# EXPERIMENTAL build (HOST-RUN): experimental-ratelimit (PPE plugin, embedded
+# Limitador). The gateway runs on the host; mock-llm + jwt-issuer run in compose.
+GATEWAY_BIN=${GATEWAY_BIN}
 PRAXIS_CONFIG=ratelimit-limitador.yaml
-PRAXIS_POLICY_CONFIG_PATH=./config/praxis/ratelimit-policy.yaml
 RUST_LOG=info
 INFERENCE_SIM_VERSION=v0.1.1
 MOCKSERVER_VERSION=8.0.0
 EOF
 
-echo "==> Done."
-echo "    Image:  ${LOCAL_IMAGE}"
-echo "    Config: ratelimit-limitador.yaml (+ ratelimit-policy.yaml)"
-echo "    Next:   make deploy-gateway && ./test/test-ratelimit-limitador.sh"
+step "Done."
+printf "    Binary: %s\n" "$GATEWAY_BIN"
+printf "    Config: config/praxis/ratelimit-limitador.yaml (+ ratelimit-policy.yaml)\n"
+printf "    Next:   make jwt-tokens && ./build/run-experimental.sh start && make test\n"

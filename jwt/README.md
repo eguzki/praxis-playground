@@ -51,7 +51,9 @@ The `jwt-issuer` service (nginx) serves the JWKS at:
 - `http://jwt-issuer/.well-known/jwks.json`
 - `http://localhost:8888/jwks.json` (from host)
 
-Praxis configs reference: `http://jwt-issuer/jwks.json`
+Praxis config reference: `http://localhost:8888/jwks.json` (the host gateway
+reaches the issuer via the compose port map; the `jwt-issuer` service name only
+resolves from inside the compose network).
 
 ## Usage in Tests
 

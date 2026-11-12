@@ -4,7 +4,9 @@
 # Service URLs
 PRAXIS_URL="${PRAXIS_URL:-http://localhost:8080}"
 PRAXIS_METRICS_URL="${PRAXIS_METRICS_URL:-http://localhost:9901}"
-JWT_DIR="${JWT_DIR:-./jwt/tokens}"
+# Resolve relative to this file (repo-root/jwt/tokens), so it works regardless of
+# the caller's cwd (run-all.sh cd's into test/).
+JWT_DIR="${JWT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/jwt/tokens}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -14,20 +16,22 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Logging helpers
+# Logs go to stderr so helpers whose stdout is captured (e.g. get_token in
+# `tok=$(get_token ...)`) never leak log text into the captured value.
 log_info() {
-  echo -e "${BLUE}[INFO]${NC} $*"
+  echo -e "${BLUE}[INFO]${NC} $*" >&2
 }
 
 log_success() {
-  echo -e "${GREEN}[✓]${NC} $*"
+  echo -e "${GREEN}[✓]${NC} $*" >&2
 }
 
 log_warn() {
-  echo -e "${YELLOW}[!]${NC} $*"
+  echo -e "${YELLOW}[!]${NC} $*" >&2
 }
 
 log_error() {
-  echo -e "${RED}[✗]${NC} $*"
+  echo -e "${RED}[✗]${NC} $*" >&2
 }
 
 # Token loading

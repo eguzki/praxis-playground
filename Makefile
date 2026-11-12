@@ -1,4 +1,4 @@
-.PHONY: help setup clean gateway gateway-basic gateway-experimental deploy-gateway up down logs jwt-tokens test
+.PHONY: help setup clean gateway gateway-basic gateway-experimental deploy-gateway up down logs logs-experimental jwt-tokens test run-experimental stop-experimental
 
 help: ## Show this help message
 	@echo 'Usage: make [target]'
@@ -15,8 +15,14 @@ jwt-tokens: ## Generate JWT tokens and JWKS
 gateway-basic: ## Build BASIC gateway (pull released image, minimal proxy config)
 	@./build/build-basic.sh
 
-gateway-experimental: ## Build EXPERIMENTAL gateway (compile experimental-ratelimit)
+gateway-experimental: ## Build EXPERIMENTAL gateway on the HOST (compile experimental-ratelimit)
 	@./build/build-experimental.sh
+
+run-experimental: ## Start host experimental gateway + supporting compose services
+	@./build/run-experimental.sh start
+
+stop-experimental: ## Stop host experimental gateway + supporting compose services
+	@./build/run-experimental.sh stop
 
 gateway: gateway-basic ## Alias for gateway-basic (the default build)
 
@@ -31,12 +37,15 @@ up: ## Start all services
 down: ## Stop all services
 	@docker compose down
 
-logs: ## Tail praxis-gateway logs
+logs: ## Tail praxis-gateway logs (basic/docker gateway)
 	@docker compose logs -f praxis-gateway
+
+logs-experimental: ## Tail the host experimental gateway log
+	@tail -f gateway-local.log
 
 clean: ## Stop and remove all containers, networks, volumes
 	@echo "Cleaning up..."
 	@docker compose down -v
 
-test: ## Run tests for current configuration
-	@./test/run-all.sh
+test: ## Run tests for current configuration (reads .env for PRAXIS_CONFIG)
+	@set -a; [ -f .env ] && . ./.env; set +a; ./test/run-all.sh

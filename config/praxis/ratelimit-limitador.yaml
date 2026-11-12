@@ -1,5 +1,5 @@
 # Ratelimit/Limitador - Praxis PPE `ratelimit/limitador` plugin (request-count,
-# EMBEDDED in-memory Limitador). Plugin from praxis-proxy/policy (merged PR #178).
+# EMBEDDED in-memory Limitador). Plugin released in praxis-policy v0.6.0.
 #
 # Chain: policy -> router -> load_balancer. The `policy` filter embeds the Praxis
 # Policy Engine; the policy document (ratelimit-policy.yaml) declares:
@@ -9,9 +9,11 @@
 #
 # DESIGN NOTE: The ratelimit plugin runs at the engine hook `ratelimit.post_identity`
 # (NOT `http.request`, and it "cannot run from an APL run(name) step"). The host
-# (core's policy filter) must invoke this hook after identity resolution -- that
-# wiring is tracked upstream by praxis-proxy/praxis#1478 and is NOT in any released
-# core, so this config requires building with APPLY_RATELIMIT_PATCHES=true.
+# (core's policy filter) invokes this hook after identity resolution -- that wiring
+# (praxis-proxy/praxis#1478) is MERGED and shipped in core v0.8.0, which praxis-ai
+# pins (-> policy v0.6.0). So no vendoring/forward-port is needed; the experimental
+# build only applies a thin overlay (panic="unwind" + a policy-experimental-ratelimit
+# feature passthrough).
 #
 # Config shape:
 #   * Plugin declares `hooks: [ratelimit.post_identity]`
@@ -21,9 +23,11 @@
 #   * Over-budget denial: HTTP 429
 #   * Missing/non-string bound attribute: denied (so no `tier` claim = denied)
 #
-# Requires:
-#   - Build: PRAXIS_FEATURES=full,experimental-ratelimit APPLY_RATELIMIT_PATCHES=true
-#   - Runtime: PRAXIS_POLICY_CONFIG=ratelimit-policy.yaml
+# Requires (host-run; see build/build-experimental.sh + build/run-experimental.sh):
+#   - A host binary built with --features full,experimental-ratelimit and the thin
+#     overlay (panic="unwind" + feature passthrough).
+#   - Supporting services (mock-llm, jwt-issuer) up via docker compose.
+#   - The gateway run from this config's directory so config_path resolves.
 
 admin:
   metrics_address: "0.0.0.0:9901"
@@ -38,8 +42,11 @@ filter_chains:
   - name: main
     filters:
       - filter: policy
-        config_path: /etc/praxis/policy.yaml
-        # Permit policy-engine JWKS fetch to reach Docker service IP.
+        # Host-run: a bare sibling filename. run-experimental.sh execs the binary
+        # FROM this config's directory, so this resolves whether config_path is
+        # taken relative to the cwd or to this file's directory.
+        config_path: ratelimit-policy.yaml
+        # JWKS is fetched from localhost (a private/loopback address).
         # No body_access: the plugin acts around identity.resolve (pre-body).
         allow_private_idp: true
 
@@ -62,15 +69,17 @@ filter_chains:
         clusters:
           - name: openai_backend
             endpoints:
-              - "mock-llm:1080"
+              - "127.0.0.1:1080"
           - name: anthropic_backend
             endpoints:
-              - "mock-llm:1080"
+              - "127.0.0.1:1080"
           - name: gemini_backend
             endpoints:
-              - "mock-llm:1080"
+              - "127.0.0.1:1080"
 
 insecure_options:
+  # Loopback upstreams/IdP are private addresses; a real proxy refuses these by
+  # default. Explicit opt-in for a single-machine demo. No `allow_root`: the host
+  # binary runs as your user, not root.
   allow_private_upstreams: true
   allow_private_endpoints: true
-  allow_root: true  # Docker runs as root by default

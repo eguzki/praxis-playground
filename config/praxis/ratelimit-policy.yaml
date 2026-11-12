@@ -25,7 +25,9 @@ plugins:
           algorithms: ["RS256"]
           decoding_key:
             kind: jwks_url
-            url: "http://jwt-issuer/jwks.json"
+            # Host-run: the gateway runs on the host and reaches jwt-issuer via
+            # its compose port map on localhost (8888:80), not the service name.
+            url: "http://localhost:8888/jwks.json"
             insecure_http: true
       claim_mapper: standard
       # Expose the custom `tier` claim so the ratelimit bindings can read it.
@@ -83,7 +85,7 @@ global:
   rate_limits:
     - ratelimit
   # require(authenticated) keeps the http.request authorization path active,
-  # which is where the host forward-port invokes ratelimit.post_identity
+  # which is where core's policy filter (v0.8.0) invokes ratelimit.post_identity
   # (after identity.resolve); it also rejects unauthenticated calls (401).
   authorization:
     pre_invocation:

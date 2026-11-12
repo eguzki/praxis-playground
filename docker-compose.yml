@@ -36,11 +36,12 @@ services:
     networks:
       - praxis-net
 
-  # --- Praxis Gateway ---
-  # The image is produced by one of the two build scripts, which also write
-  # GATEWAY_IMAGE + PRAXIS_CONFIG into .env:
-  #   ./build/build-basic.sh         -> praxis-gateway:basic
-  #   ./build/build-experimental.sh  -> praxis-gateway:experimental
+  # --- Praxis Gateway (BASIC build only) ---
+  # Runs the released image for the BASIC build. ./build/build-basic.sh writes
+  # GATEWAY_IMAGE + PRAXIS_CONFIG into .env, and `make deploy-gateway` brings this
+  # service up. The EXPERIMENTAL build does NOT use this service - it compiles a
+  # host binary (./build/build-experimental.sh) run by ./build/run-experimental.sh;
+  # that script brings up only the supporting services above, not this one.
 
   praxis-gateway:
     image: ${GATEWAY_IMAGE:-praxis-gateway:basic}

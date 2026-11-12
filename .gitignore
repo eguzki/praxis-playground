@@ -13,6 +13,10 @@ jwt/tokens/
 # Build artifacts
 build/praxis/.cache/
 
+# Local host build+run (build-experimental-local.sh)
+build/.praxis-ai/
+.gateway-local.pid
+
 # Logs
 *.log
 
